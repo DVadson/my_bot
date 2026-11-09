@@ -3,3 +3,4 @@ apscheduler
 openai
 python-dotenv
 boto3
+
