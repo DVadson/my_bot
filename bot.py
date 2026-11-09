@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import json
 import os
+import boto3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, types
@@ -14,7 +15,6 @@ from dotenv import load_dotenv
 # Загружаем переменные из файла .env
 load_dotenv()
 
-# Достаем ключи из окружения
 TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
 
@@ -24,15 +24,42 @@ if not TOKEN or not DEEPSEEK_KEY:
 DB_PATH = 'tasks.db'
 TZ = ZoneInfo("Europe/Moscow")
 
+# --- S3 НАСТРОЙКИ ---
+S3_URL = "https://s3.twcstorage.ru"
+S3_BUCKET = "mybot-storage"
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "VLSPTFLZ4APPVRLT1V3E")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "3e8Te5EzCc3ZItqQWFbb4hI47fRNzPsClVNLtLdG")
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=S3_URL,
+    aws_access_key_id=S3_ACCESS_KEY,
+    aws_secret_access_key=S3_SECRET_KEY,
+    region_name='ru-1'
+)
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# Клиент для работы с DeepSeek
 ai_client = AsyncOpenAI(
     api_key=DEEPSEEK_KEY,
     base_url="https://api.deepseek.com"
 )
+
+def download_db():
+    try:
+        s3_client.download_file(S3_BUCKET, 'tasks.db', DB_PATH)
+        print("База скачана из S3.")
+    except Exception as e:
+        print(f"База не найдена в S3 (или ошибка), создаем новую: {e}")
+
+def upload_db():
+    try:
+        s3_client.upload_file(DB_PATH, S3_BUCKET, 'tasks.db')
+        print("База сохранена в S3.")
+    except Exception as e:
+        print(f"Ошибка загрузки базы в S3: {e}")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -55,6 +82,7 @@ def add_task(user_id: int, text: str, remind_at: str):
                 (user_id, text, remind_at))
     conn.commit()
     conn.close()
+    upload_db()
 
 def get_pending_tasks():
     now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M')
@@ -71,6 +99,7 @@ def delete_task(task_id: int, user_id: int):
     cur.execute('DELETE FROM tasks WHERE id = ? AND user_id = ?', (task_id, user_id))
     conn.commit()
     conn.close()
+    upload_db()
 
 async def check_reminders():
     tasks = get_pending_tasks()
@@ -81,7 +110,6 @@ async def check_reminders():
         except Exception as e:
             print(f"Ошибка при отправке {task_id}: {e}")
 
-# --- Клавиатура ---
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📋 Список задач")
@@ -102,7 +130,6 @@ async def send_task_list(chat_id: int, user_id: int):
     lines = [f"ID {task_id}: {text} — {remind_at}" for task_id, text, remind_at in rows]
     await bot.send_message(chat_id=chat_id, text="Твои задачи:\n" + "\n".join(lines))
 
-# --- Команды ---
 @dp.message(Command('start'))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -128,7 +155,6 @@ async def cmd_del(message: types.Message):
     delete_task(task_id, message.from_user.id)
     await message.answer(f"🗑 Задача {task_id} удалена (если она существовала).")
 
-# --- Обработка кнопки и текста ---
 @dp.message()
 async def handle_text(message: types.Message):
     if message.text.startswith('/'):
@@ -146,10 +172,10 @@ async def handle_text(message: types.Message):
     
     Твоя задача — понять, просит ли пользователь создать напоминание.
     
-    Если он просит напомнить о чем-то (например, "напомни завтра в 10:00..."), ответь СТРОГО в формате JSON:
+    Если он просит напомнить о чем-то, ответь СТРОГО в формате JSON:
     {{"action": "remind", "task": "текст задачи", "remind_at": "ГГГГ-ММ-ДД ЧЧ:ММ"}}
     
-    Если это просто вопрос или болтовня (например, "как дела?", "кто ты?"), ответь СТРОГО в формате JSON:
+    Если это просто вопрос или болтовня, ответь СТРОГО в формате JSON:
     {{"action": "chat", "reply": "твой текстовый ответ пользователю"}}
     
     Не добавляй никаких других полей и разметки!
@@ -191,7 +217,10 @@ async def handle_text(message: types.Message):
         await message.answer("❌ Не смог понять задачу. Попробуй переформулировать.")
 
 async def main():
+    download_db()
     init_db()
+    upload_db()
+    
     scheduler.add_job(check_reminders, 'interval', seconds=30)
     scheduler.start()
     
