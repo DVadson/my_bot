@@ -145,7 +145,7 @@ def decode_mime_words(s):
 
 async def check_email(chat_id: int, silent=False):
     try:
-        mail = imaplib.IMAP4_SSL("imap.yandex.ru")
+        mail = imaplib.IMAP4_SSL("imap.yandex.ru", 993)
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select("inbox")
         
