@@ -22,6 +22,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
+ADMIN_ID = 802266675  # Твой Telegram ID
 
 if not TOKEN or not DEEPSEEK_KEY:
     raise ValueError("Ошибка: Проверь файл .env! В нем должны быть BOT_TOKEN и DEEPSEEK_API_KEY")
@@ -172,7 +173,7 @@ async def check_email(chat_id: int, silent=False):
                     
                     message_id = msg.get("Message-ID", "")
                     if message_id and is_email_seen(message_id):
-                        continue # Пропускаем, если уже видели
+                        continue 
 
                     sender = decode_mime_words(msg.get("From", "Неизвестный отправитель"))
                     subject = decode_mime_words(msg.get("Subject", "Без темы"))
@@ -217,7 +218,7 @@ async def check_email(chat_id: int, silent=False):
                     mail.store(i, '+FLAGS', '\\Seen')
 
         if silent and new_emails_count == 0:
-            pass # Если тихая проверка и писем нет, ничего не пишем
+            pass 
 
         mail.logout()
     except Exception as e:
@@ -347,12 +348,9 @@ async def main():
     init_db()
     upload_db()
     
-    # Запускаем проверку почты каждые 10 минут
-    # ВАЖНО: Для этого нужен твой user_id, чтобы бот знал, кому писать. 
-    # Пока он шлет только в чат по кнопке. Для фона нужен ID. 
-    # Но для простоты мы оставим проверку только по кнопке и команде, 
-    # чтобы не засорять код. Если захочешь фоновую - напиши.
-
+    # Запускаем фоновую проверку почты каждые 10 минут (600 секунд)
+    scheduler.add_job(check_email, 'interval', seconds=600, args=[ADMIN_ID], kwargs={'silent': True})
+    
     scheduler.add_job(check_reminders, 'interval', seconds=30)
     scheduler.start()
     
