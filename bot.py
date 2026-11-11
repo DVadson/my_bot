@@ -3,6 +3,9 @@ import sqlite3
 import json
 import os
 import boto3
+import imaplib
+import email
+from email.header import decode_header
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, types
@@ -17,6 +20,8 @@ load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
 
 if not TOKEN or not DEEPSEEK_KEY:
     raise ValueError("Ошибка: Проверь файл .env! В нем должны быть BOT_TOKEN и DEEPSEEK_API_KEY")
@@ -52,7 +57,7 @@ def download_db():
         s3_client.download_file(S3_BUCKET, 'tasks.db', DB_PATH)
         print("База скачана из S3.")
     except Exception as e:
-        print(f"База не найдена в S3 (или ошибка), создаем новую: {e}")
+        print(f"База не найдена в S3: {e}")
 
 def upload_db():
     try:
@@ -72,8 +77,29 @@ def init_db():
             remind_at TEXT
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS seen_emails (
+            message_id TEXT PRIMARY KEY
+        )
+    ''')
     conn.commit()
     conn.close()
+
+def is_email_seen(message_id: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM seen_emails WHERE message_id = ?', (message_id,))
+    res = cur.fetchone()
+    conn.close()
+    return res is not None
+
+def mark_email_seen(message_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('INSERT OR IGNORE INTO seen_emails (message_id) VALUES (?)', (message_id,))
+    conn.commit()
+    conn.close()
+    upload_db()
 
 def add_task(user_id: int, text: str, remind_at: str):
     conn = sqlite3.connect(DB_PATH)
@@ -110,10 +136,100 @@ async def check_reminders():
         except Exception as e:
             print(f"Ошибка при отправке {task_id}: {e}")
 
+# --- ПРОВЕРКА ПОЧТЫ ---
+def decode_mime_words(s):
+    if not s:
+        return ""
+    return ''.join(word.decode(encoding or 'utf-8') if isinstance(word, bytes) else word for word, encoding in decode_header(s))
+
+async def check_email(chat_id: int, silent=False):
+    try:
+        mail = imaplib.IMAP4_SSL("imap.yandex.ru")
+        mail.login(EMAIL_USER, EMAIL_PASS)
+        mail.select("inbox")
+        
+        status, messages = mail.search(None, "UNSEEN")
+        if status != "OK":
+            if not silent: await bot.send_message(chat_id=chat_id, text="Не удалось проверить почту.")
+            mail.logout()
+            return
+            
+        mail_ids = messages[0].split()
+        if not mail_ids:
+            if not silent: await bot.send_message(chat_id=chat_id, text="Новых писем нет.")
+            mail.logout()
+            return
+
+        if not silent:
+            await bot.send_message(chat_id=chat_id, text=f"Найдено {len(mail_ids)} новых писем. Обрабатываю...")
+        
+        new_emails_count = 0
+        for i in mail_ids[-5:]:
+            status, msg_data = mail.fetch(i, "(RFC822)")
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    
+                    message_id = msg.get("Message-ID", "")
+                    if message_id and is_email_seen(message_id):
+                        continue # Пропускаем, если уже видели
+
+                    sender = decode_mime_words(msg.get("From", "Неизвестный отправитель"))
+                    subject = decode_mime_words(msg.get("Subject", "Без темы"))
+                    
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == "text/plain":
+                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                break
+                    else:
+                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    
+                    prompt = f"""
+                    Отправитель: {sender}
+                    Тема: {subject}
+                    Текст письма: {body[:2000]}
+                    
+                    Сделай краткое изложение этого письма на русском языке (максимум 2-3 предложения).
+                    """
+                    
+                    try:
+                        ai_response = await ai_client.chat.completions.create(
+                            model="deepseek-chat",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.3
+                        )
+                        summary = ai_response.choices[0].message.content.strip()
+                        
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"📧 **Отправитель:** {sender}\n**Суть:** {summary}",
+                            parse_mode="Markdown"
+                        )
+                        new_emails_count += 1
+                    except Exception as e:
+                        await bot.send_message(chat_id=chat_id, text=f"📧 {sender}: (Ошибка ИИ при пересказе)")
+                        print(f"Ошибка DeepSeek: {e}")
+                    
+                    if message_id:
+                        mark_email_seen(message_id)
+                    mail.store(i, '+FLAGS', '\\Seen')
+
+        if silent and new_emails_count == 0:
+            pass # Если тихая проверка и писем нет, ничего не пишем
+
+        mail.logout()
+    except Exception as e:
+        print(f"Ошибка почты: {e}")
+        if not silent: await bot.send_message(chat_id=chat_id, text="❌ Ошибка при подключении к почте. Проверь логи.")
+
+# --- Клавиатура ---
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📋 Список задач")
-    builder.adjust(1)
+    builder.button(text="📬 Проверить почту")
+    builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
 async def send_task_list(chat_id: int, user_id: int):
@@ -130,6 +246,7 @@ async def send_task_list(chat_id: int, user_id: int):
     lines = [f"ID {task_id}: {text} — {remind_at}" for task_id, text, remind_at in rows]
     await bot.send_message(chat_id=chat_id, text="Твои задачи:\n" + "\n".join(lines))
 
+# --- Команды ---
 @dp.message(Command('start'))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -144,6 +261,10 @@ async def cmd_start(message: types.Message):
 async def cmd_list(message: types.Message):
     await send_task_list(message.chat.id, message.from_user.id)
 
+@dp.message(Command('mail'))
+async def cmd_mail(message: types.Message):
+    await check_email(message.chat.id)
+
 @dp.message(Command('del'))
 async def cmd_del(message: types.Message):
     args = message.text.split()
@@ -153,8 +274,9 @@ async def cmd_del(message: types.Message):
     
     task_id = int(args[1])
     delete_task(task_id, message.from_user.id)
-    await message.answer(f"🗑 Задача {task_id} удалена (если она существовала).")
+    await message.answer(f"🗑 Задача {task_id} удалена.")
 
+# --- Обработка кнопок и текста ---
 @dp.message()
 async def handle_text(message: types.Message):
     if message.text.startswith('/'):
@@ -162,6 +284,10 @@ async def handle_text(message: types.Message):
 
     if message.text == "📋 Список задач":
         await send_task_list(message.chat.id, message.from_user.id)
+        return
+
+    if message.text == "📬 Проверить почту":
+        await check_email(message.chat.id)
         return
 
     now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M')
@@ -221,6 +347,12 @@ async def main():
     init_db()
     upload_db()
     
+    # Запускаем проверку почты каждые 10 минут
+    # ВАЖНО: Для этого нужен твой user_id, чтобы бот знал, кому писать. 
+    # Пока он шлет только в чат по кнопке. Для фона нужен ID. 
+    # Но для простоты мы оставим проверку только по кнопке и команде, 
+    # чтобы не засорять код. Если захочешь фоновую - напиши.
+
     scheduler.add_job(check_reminders, 'interval', seconds=30)
     scheduler.start()
     
